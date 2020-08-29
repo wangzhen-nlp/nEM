@@ -1,6 +1,7 @@
 import os
-import argparse
 import time
+import random
+import argparse
 import numpy as np
 import torch
 import torch.nn as nn
@@ -50,338 +51,474 @@ parser.add_argument('--em', dest='em', action="store_true", help="Using EM", def
 parser.add_argument('--sigmoid', dest='sigmoid', action="store_true", help="Using sigmoid to activate scores", default=False)
 parser.add_argument("--per_e_step", dest='per_e_step', type=int, help="How many m steps before e step", default=500)
 parser.add_argument('--flip', dest='flip', type=float, help="Label flip rate", default=0.)
+parser.add_argument('--seed', dest='seed', type=int, help="Fix seed for reproduction", default=123)
+parser.add_argument('--trans_em', dest='trans_em', action="store_true", help="EM transition matrix", default=False)
+parser.add_argument('--requires_grad', dest='requires_grad', action="store_true", default=False)
+parser.add_argument('--norm', dest='norm', action="store_true", default=False)
+parser.add_argument('--fix_label', dest='fix_label', action="store_true", default=False)
+parser.add_argument('--pretrain', dest='pretrain', action="store_true", default=False)
+parser.add_argument('--pretrain_epochs', dest='pretrain_epochs', type=int, default=1)
+parser.add_argument('--q', dest='q', type=float, default=0.)
+parser.add_argument('--l2', dest='l2', action="store_true", default=False)
+parser.add_argument('--noise', dest='noise', action="store_true", default=False)
+parser.add_argument('--beta', dest='beta', type=float, default=1.)
+parser.add_argument('--temperature', dest='temperature', type=float, default=1.)
+parser.add_argument('--base', dest='base', action="store_true", default=False)
+parser.add_argument('--hard', dest='hard', action="store_true", default=False)
+parser.add_argument('--threshold', dest='threshold', type=float, default=0.5)
+parser.add_argument('--curriculum', dest='curriculum', action="store_true", default=False)
+parser.add_argument('--transform', dest='transform', action="store_true", default=False)
+parser.add_argument('--transform_norm', dest='transform_norm', action="store_true", default=False)
+parser.add_argument('--dropout', dest='dropout', type=float, default=0.5)
+parser.add_argument('--n_head', dest='n_head', type=int, default=6)
+parser.add_argument('--num_layers', dest='num_layers', type=int, default=1)
+parser.add_argument('--indep', dest='indep', action="store_true", default=False)
+parser.add_argument('--noise_wd', dest='noise_wd', action="store_true", default=False)
+parser.add_argument('--transform_wd', dest='transform_wd', action="store_true", default=False)
+parser.add_argument('--mid_reg_l1', dest='mid_reg_l1', type=float, default=0.)
+parser.add_argument('--mid_reg_l2', dest='mid_reg_l2', type=float, default=0.)
+parser.add_argument('--test_show', dest='test_show', action="store_true", default=False)
+parser.add_argument('--attn_type', dest='attn_type', type=str, default="dot")
+parser.add_argument('--tanh_query', dest='tanh_query', action="store_true", default=False)
+parser.add_argument('--norm_attn', dest='norm_attn', action="store_true", default=False)
+parser.add_argument('--use_rl', dest='use_rl', action="store_true", default=False)
+parser.add_argument('--rl_weight', dest='rl_weight', type=float, default=1.)
+parser.add_argument('--rl_reward', dest='rl_reward', type=str, default='sum_lik')
+parser.add_argument('--rl_num', dest='rl_num', type=int, default=1)
 
 args = parser.parse_args()
 use_cuda = torch.cuda.is_available()
 
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed(args.seed)
+np.random.seed(args.seed)
+random.seed(args.seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+
 def use_optimizer(model, lr, weight_decay=0, lr_decay=0, momentum=0, rho=0.95, method='sgd'):
-	parameters = filter(lambda p: p.requires_grad, model.parameters())
-	if method=='sgd':
-		return optim.SGD(parameters, lr=lr, momentum=momentum, weight_decay=weight_decay)
-	elif method=='adagrad':
-		return optim.Adagrad(parameters, lr=lr, lr_decay=lr_decay, weight_decay=weight_decay)
-	elif method=='adadelta':
-		return optim.Adadelta(parameters, rho=rho, lr=lr, weight_decay=weight_decay)
-	elif method=='adam':
-		return optim.Adam(parameters, lr=lr, weight_decay=weight_decay)
-	elif method=='rmsprop':
-		return optim.RMSprop(parameters, lr=lr, weight_decay=weight_decay)		
-	else:
-		raise Exception("Invalid method, option('sgd', 'adagrad', 'adadelta', 'adam')")
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(name)
+    if method=='sgd':
+        return optim.SGD(parameters, lr=lr, momentum=momentum, weight_decay=weight_decay)
+    elif method=='adagrad':
+        return optim.Adagrad(parameters, lr=lr, lr_decay=lr_decay, weight_decay=weight_decay)
+    elif method=='adadelta':
+        return optim.Adadelta(parameters, rho=rho, lr=lr, weight_decay=weight_decay)
+    elif method=='adam':
+        return optim.Adam(parameters, lr=lr, weight_decay=weight_decay)
+    elif method=='rmsprop':
+        return optim.RMSprop(parameters, lr=lr, weight_decay=weight_decay)
+    else:
+        raise Exception("Invalid method, option('sgd', 'adagrad', 'adadelta', 'adam')")
+
 
 def save_checkpoint(state, step):
-	torch.save(state, args.save_dir+'%d_step.mod.tar'%step)	
+    torch.save(state, args.save_dir+'%d_step.mod.tar'%step)
+
 
 def resume(step):
-	load_file = args.save_dir+'%d_step.mod.tar'%step
-	if os.path.isfile(load_file):	
-		checkpoint = torch.load(load_file)	
-		return checkpoint	
+    load_file = args.save_dir+'%d_step.mod.tar'%step
+    if os.path.isfile(load_file):
+        checkpoint = torch.load(load_file)
+        return checkpoint
+
 
 def MAP(Y_pred, Y_test):
-	# the mean average precision given prediction
-	(n_items, n_labels) = Y_pred.shape
-	sort_pred = np.argsort(Y_pred, axis=1)[:,::-1]
-	ranked = []
-	for i in range(0, n_items):
-		rank_list = []
-		for j in range(0, n_labels):
-			if Y_test[i][sort_pred[i][j]]==1:
-				rank_list.append(j+1)
-		ranked.append(rank_list)
-	AP = []
-	for item in ranked:
-		if len(item)!=0:
-			AP.append(np.mean(np.asarray(range(1,len(item)+1), dtype=np.float32)/np.array(item)))
-	return np.mean(np.array(AP))
+    # the mean average precision given prediction
+    (n_items, n_labels) = Y_pred.shape
+    sort_pred = np.argsort(Y_pred, axis=1)[:,::-1]
+    ranked = []
+    for i in range(0, n_items):
+        rank_list = []
+        for j in range(0, n_labels):
+            if Y_test[i][sort_pred[i][j]]==1:
+                rank_list.append(j+1)
+        ranked.append(rank_list)
+    AP = []
+    for item in ranked:
+        if len(item)!=0:
+            AP.append(np.mean(np.asarray(list(range(1,len(item)+1)), dtype=np.float32)/np.array(item)))
+    return np.mean(np.array(AP))
+
 
 def precision_recall(y_score, Y_test):
-	sort_pred = np.argsort(y_score.ravel())[::-1]
-	sort_y = Y_test.ravel()[sort_pred]
-	all_positive = np.sum(sort_y)
-	positives = 0
-	precision = []
-	recall = []
-	for i in range(0, len(sort_y)):
-		if sort_y[i]==1:
-			positives += 1
-		precision.append(positives/float(i+1))
-		recall.append(positives/float(all_positive))
-	return np.asarray(precision, dtype=np.float32), np.asarray(recall, dtype=np.float32)
+    sort_pred = np.argsort(y_score.ravel())[::-1]
+    sort_y = Y_test.ravel()[sort_pred]
+    all_positive = np.sum(sort_y)
+    positives = 0
+    precision = []
+    recall = []
+    for i in range(0, len(sort_y)):
+        if sort_y[i]==1:
+            positives += 1
+        precision.append(positives/float(i+1))
+        recall.append(positives/float(all_positive))
+    return np.asarray(precision, dtype=np.float32), np.asarray(recall, dtype=np.float32)
 
-def get_pre_recall(y_score, Y_test, name='y'):
-	precision, recall = precision_recall(y_score, Y_test)		
-	np.save(args.save_dir+'%s_precision'%name, precision)
-	np.save(args.save_dir+'%s_recall'%name, recall)
+
+def get_pre_recall(y_score, Y_test, name='y', dataset='test'):
+    precision, recall = precision_recall(y_score, Y_test)
+    if dataset == 'test':
+        np.save(args.save_dir+'%s_precision'%name, precision)
+        np.save(args.save_dir+'%s_recall'%name, recall)
+    elif dataset == 'test_auto':
+        np.save(args.save_dir+'%s_precision_auto'%name, precision)
+        np.save(args.save_dir+'%s_recall_auto'%name, recall)
+    else:
+        raise NotImplementedError
+
 
 def pr_with_threshold(y_score, Y_test, threshold=0.5):
-	gold = 0.
-	pred = 0.
-	correct = 0.
-	shapes = y_score.shape
-	for i in range(shapes[0]):
-		for j in range(shapes[1]):
-			if Y_test[i, j]==1:
-				gold += 1
-				if y_score[i, j]>threshold:
-					pred += 1
-					correct += 1
-			else:
-				if y_score[i, j]>threshold:
-					pred += 1
-	if pred==0 or gold==0:
-		p = 0
-		r = 0
-		f1 = 0
-	else:
-		p = correct/pred
-		r = correct/gold
-		f1 = 2.0*p*r/(p+r)
-	return p,r,f1		
+    gold = 0.
+    pred = 0.
+    correct = 0.
+    shapes = y_score.shape
+    for i in range(shapes[0]):
+        for j in range(shapes[1]):
+            if Y_test[i, j]==1:
+                gold += 1
+                if y_score[i, j]>threshold:
+                    pred += 1
+                    correct += 1
+            else:
+                if y_score[i, j]>threshold:
+                    pred += 1
+    if pred==0 or gold==0:
+        p = 0
+        r = 0
+        f1 = 0
+    else:
+        p = correct/pred
+        r = correct/gold
+        f1 = 2.0*p*r/(p+r)
+    return p,r,f1
+
 
 def write_list_to_file(l, file):
-	with open(file, 'wb') as f:
-		strs = ','.join([str(x) for x in l])
-		f.write(strs+'\n')
+    with open(file, 'wb') as f:
+        strs = ','.join([str(x) for x in l])
+        f.write(strs+'\n')
 
-def PR_curve(cdir='pr'):	
-	plt.clf()
-	filename = [['PCNN+ATT', 'PCNN+ATT+nEM'], ['PCNN+MEAN', 'PCNN+MEAN+nEM'], ['PCNN+MAX', 'PCNN+MAX+nEM']]
-	# filename = [['PCNN+ATT', 'PCNN+ATT+LD'], ['PCNN+ATT+0.01', 'PCNN+ATT+LD+0.01'], ['PCNN+ATT+0.02', 'PCNN+ATT+LD+0.02'], ['PCNN+ATT+0.04', 'PCNN+ATT+LD+0.04'], ['PCNN+ATT+0.08', 'PCNN+ATT+LD+0.08']]
-	color = ['red', 'green', 'black']
-	# color = ['red', 'magenta', 'darkorange', 'cornflowerblue', 'black']
-	# color = ['red', 'turquoise', 'darkorange', 'cornflowerblue', 'teal', 'green', 'black', 'magenta']	
-	for i in range(len(filename)):
-		p1 = np.load('./%s/'%cdir+filename[i][0]+'_precision.npy')[:3000]
-		r1  = np.load('./%s/'%cdir+filename[i][0]+'_recall.npy')[:3000]
-		p2 = np.load('./%s/'%cdir+filename[i][1]+'_precision.npy')[:3000]
-		r2  = np.load('./%s/'%cdir+filename[i][1]+'_recall.npy')[:3000]		
-		plt.plot(r1, p1, color = color[i], ls=':', lw=1.5, label = filename[i][0])
-		plt.plot(r2, p2, color = color[i], ls='-', lw=2, label = filename[i][1])
-		write_list_to_file(p1, 'drawcurve/pr/'+filename[i][0]+'_precision.txt')
-		write_list_to_file(r1, 'drawcurve/pr/'+filename[i][0]+'_recall.txt')
-		write_list_to_file(p2, 'drawcurve/pr/'+filename[i][1]+'_precision.txt')
-		write_list_to_file(r2, 'drawcurve/pr/'+filename[i][1]+'_recall.txt')		
-	plt.xlabel('Recall')
-	plt.ylabel('Precision')
-	plt.ylim([0.6, 0.9])
-	plt.xlim([0.0, 0.5])
-	plt.legend(loc="upper right")
-	leg = plt.gca().get_legend()
-	ltext = leg.get_texts()
-	plt.setp(ltext, fontsize='small')	
-	plt.grid(True)	 
-	plt.savefig('%s/PR_curve.png'%cdir)	
+
+def PR_curve(cdir='pr'):
+    plt.clf()
+    filename = [['PCNN+ATT', 'PCNN+ATT+nEM'], ['PCNN+MEAN', 'PCNN+MEAN+nEM'], ['PCNN+MAX', 'PCNN+MAX+nEM']]
+    # filename = [['PCNN+ATT', 'PCNN+ATT+LD'], ['PCNN+ATT+0.01', 'PCNN+ATT+LD+0.01'], ['PCNN+ATT+0.02', 'PCNN+ATT+LD+0.02'], ['PCNN+ATT+0.04', 'PCNN+ATT+LD+0.04'], ['PCNN+ATT+0.08', 'PCNN+ATT+LD+0.08']]
+    color = ['red', 'green', 'black']
+    # color = ['red', 'magenta', 'darkorange', 'cornflowerblue', 'black']
+    # color = ['red', 'turquoise', 'darkorange', 'cornflowerblue', 'teal', 'green', 'black', 'magenta']
+    for i in range(len(filename)):
+        p1 = np.load('./%s/'%cdir+filename[i][0]+'_precision.npy')[:3000]
+        r1  = np.load('./%s/'%cdir+filename[i][0]+'_recall.npy')[:3000]
+        p2 = np.load('./%s/'%cdir+filename[i][1]+'_precision.npy')[:3000]
+        r2  = np.load('./%s/'%cdir+filename[i][1]+'_recall.npy')[:3000]
+        plt.plot(r1, p1, color = color[i], ls=':', lw=1.5, label = filename[i][0])
+        plt.plot(r2, p2, color = color[i], ls='-', lw=2, label = filename[i][1])
+        write_list_to_file(p1, 'drawcurve/pr/'+filename[i][0]+'_precision.txt')
+        write_list_to_file(r1, 'drawcurve/pr/'+filename[i][0]+'_recall.txt')
+        write_list_to_file(p2, 'drawcurve/pr/'+filename[i][1]+'_precision.txt')
+        write_list_to_file(r2, 'drawcurve/pr/'+filename[i][1]+'_recall.txt')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.ylim([0.6, 0.9])
+    plt.xlim([0.0, 0.5])
+    plt.legend(loc="upper right")
+    leg = plt.gca().get_legend()
+    ltext = leg.get_texts()
+    plt.setp(ltext, fontsize='small')
+    plt.grid(True)
+    plt.savefig('%s/PR_curve.png'%cdir)
+
 
 def pred_RE(model, data_loader, dataset='test', name='y'):
-	model.eval()	
-	dataset = RE_Dataset(data_loader, dataset=dataset)
-	trainloader = data.DataLoader(dataset, batch_size=args.batch, num_workers=args.n_worker, collate_fn=dataset.data_collate)
-	pred_all = []
-	y_all = []	
-	for batch_idx, (X, musk, p1, p2, y, index) in enumerate(trainloader):	
-		X, musk, p1, p2, y = [torch.from_numpy(x) for x in X], [torch.from_numpy(x) for x in musk], [torch.from_numpy(x) for x in p1], [torch.from_numpy(x) for x in p2], torch.from_numpy(np.asarray(y, dtype=np.float32))
-		X, musk, p1, p2, y = [Variable(x, requires_grad=False) for x in X], [Variable(x, requires_grad=False) for x in musk], [Variable(x, requires_grad=False) for x in p1], [Variable(x, requires_grad=False) for x in p2], Variable(y, requires_grad=False)		
-		if use_cuda:
-			X, musk, p1, p2, y = [x.cuda() for x in X], [x.cuda() for x in musk], [x.cuda() for x in p1], [x.cuda() for x in p2], y.cuda()
-		pred = model.pred(X, musk, p1, p2)
-		pred = pred.data.cpu().numpy()
-		y = y.data.cpu().numpy()			
-		pred_all.append(pred)
-		y_all.append(y) 
-	y_score = np.concatenate(pred_all)
-	Y_test = np.concatenate(y_all)
-	ap = average_precision_score(Y_test.ravel(), y_score.ravel())
-	p,r,f1 = pr_with_threshold(y_score, Y_test)
-	return y_score,Y_test,ap,p,r,f1
+    model.eval()
+    dataset = RE_Dataset(data_loader, dataset=dataset)
+    trainloader = data.DataLoader(dataset, batch_size=args.batch, num_workers=args.n_worker, collate_fn=dataset.data_collate)
+    pred_all = []
+    y_all = []
+    for batch_idx, (X, musk, p1, p2, y, index) in enumerate(trainloader):
+        X, musk, p1, p2, y = [torch.from_numpy(x) for x in X], [torch.from_numpy(x) for x in musk], [torch.from_numpy(x) for x in p1], [torch.from_numpy(x) for x in p2], torch.from_numpy(np.asarray(y, dtype=np.float32))
+        X, musk, p1, p2, y = [Variable(x, requires_grad=False) for x in X], [Variable(x, requires_grad=False) for x in musk], [Variable(x, requires_grad=False) for x in p1], [Variable(x, requires_grad=False) for x in p2], Variable(y, requires_grad=False)
+        if use_cuda:
+            X, musk, p1, p2, y = [x.cuda() for x in X], [x.cuda() for x in musk], [x.cuda() for x in p1], [x.cuda() for x in p2], y.cuda()
+        if args.test_show:
+            pred = model.pred_show(X, musk, p1, p2)
+        else:
+            pred = model.pred(X, musk, p1, p2)
+        pred = pred.data.cpu().numpy()
+        y = y.data.cpu().numpy()
+        pred_all.append(pred)
+        y_all.append(y)
+    y_score = np.concatenate(pred_all)
+    Y_test = np.concatenate(y_all)
+    ap = average_precision_score(Y_test.ravel(), y_score.ravel())
+    p,r,f1 = pr_with_threshold(y_score, Y_test)
+    return y_score,Y_test,ap,p,r,f1
+
+
+def get_theta(model, data_loader):
+    dataset = RE_Dataset(data_loader, dataset='train')
+    trainloader = data.DataLoader(dataset, batch_size=args.batch, num_workers=args.n_worker, collate_fn=dataset.data_collate)
+    batchs = len(trainloader)
+    join_prob = np.zeros((data_loader.n_relation, 2), dtype=np.float32) + 1e-9
+    marg_prob = np.zeros((data_loader.n_relation, 2), dtype=np.float32) + 1e-9
+    for batch_idx, (X, musk, p1, p2, y, index) in enumerate(trainloader):
+        X, musk, p1, p2, y = [torch.from_numpy(x) for x in X], [torch.from_numpy(x) for x in musk], [torch.from_numpy(x) for x in p1], [torch.from_numpy(x) for x in p2], torch.from_numpy(np.asarray(y, dtype=np.int_))
+        X, musk, p1, p2, y = [Variable(x) for x in X], [Variable(x) for x in musk], [Variable(x) for x in p1], [Variable(x) for x in p2], Variable(y)
+        if use_cuda:
+            X, musk, p1, p2, y = [x.cuda() for x in X], [x.cuda() for x in musk], [x.cuda() for x in p1], [x.cuda() for x in p2], y.cuda()
+        model.eval()
+        pred = model.y_s(X, musk, p1, p2)
+        marg_prob_1 = torch.sum(pred, 0).data.cpu().numpy()
+        marg_prob_0 = torch.sum(1 - pred, 0).data.cpu().numpy()
+        join_prob_1 = torch.sum(pred * y, 0).data.cpu().numpy()
+        join_prob_0 = torch.sum((1 - pred) * y, 0).data.cpu().numpy()
+        marg_prob += np.stack([marg_prob_1, marg_prob_0], 1)
+        join_prob += np.stack([join_prob_1, join_prob_0], 1)
+    cond_prob = join_prob / marg_prob
+    model.z_y.init_transition(cond_prob)
+
 
 def e_step(model, data_loader, init=False):
-	dataset = RE_Dataset(data_loader, dataset='train')
-	trainloader = data.DataLoader(dataset, batch_size=args.batch, num_workers=args.n_worker, collate_fn=dataset.data_collate)
-	batchs = len(trainloader)	
-	Q_y1_all = []
-	index_all = []
-	for batch_idx, (X, musk, p1, p2, y, index) in enumerate(trainloader):
-		if init:
-			Q_y1_all.append(y)	
-		else:
-			X, musk, p1, p2, y = [torch.from_numpy(x) for x in X], [torch.from_numpy(x) for x in musk], [torch.from_numpy(x) for x in p1], [torch.from_numpy(x) for x in p2], torch.from_numpy(np.asarray(y, dtype=np.int_))
-			X, musk, p1, p2, y = [Variable(x) for x in X], [Variable(x) for x in musk], [Variable(x) for x in p1], [Variable(x) for x in p2], Variable(y)
-			if use_cuda:
-				X, musk, p1, p2, y = [x.cuda() for x in X], [x.cuda() for x in musk], [x.cuda() for x in p1], [x.cuda() for x in p2], y.cuda()
-			model.eval()		
-			Q_y1 = model.E_step(X, musk, p1, p2, y)
-			Q_y1_all.append(Q_y1.data.cpu().numpy())
-		index_all = index_all + index
-	Q_y1_all = np.concatenate(Q_y1_all, 0)
-	map_index = {index_all[x]:x for x in range(len(index_all))}
-	list_index = [map_index[x] for x in range(len(index_all))]
-	return Q_y1_all[list_index]
+    dataset = RE_Dataset(data_loader, dataset='train')
+    trainloader = data.DataLoader(dataset, batch_size=args.batch, num_workers=args.n_worker, collate_fn=dataset.data_collate)
+    batchs = len(trainloader)
+    Q_y1_all = []
+    index_all = []
+    join_prob = np.zeros((data_loader.n_relation, 2), dtype=np.float32) + 1e-9
+    marg_prob = np.zeros((data_loader.n_relation, 2), dtype=np.float32) + 1e-9
+    for batch_idx, (X, musk, p1, p2, y, index) in enumerate(trainloader):
+        p_y = np.asarray(y)
+        if init:
+            Q_y1_all.append(y)
+        else:
+            X, musk, p1, p2, y = [torch.from_numpy(x) for x in X], [torch.from_numpy(x) for x in musk], [torch.from_numpy(x) for x in p1], [torch.from_numpy(x) for x in p2], torch.from_numpy(np.asarray(y, dtype=np.int_))
+            X, musk, p1, p2, y = [Variable(x) for x in X], [Variable(x) for x in musk], [Variable(x) for x in p1], [Variable(x) for x in p2], Variable(y)
+            if use_cuda:
+                X, musk, p1, p2, y = [x.cuda() for x in X], [x.cuda() for x in musk], [x.cuda() for x in p1], [x.cuda() for x in p2], y.cuda()
+            model.eval()
+            Q_y1 = model.E_step(X, musk, p1, p2, y)
+            Q_y1_all.append(Q_y1.data.cpu().numpy())
+        q_y = np.asarray(Q_y1_all[-1])
+        join_prob += np.stack([np.sum(p_y * q_y, 0), np.sum(p_y * (1 - q_y), 0)], 1)
+        marg_prob += np.stack([np.sum(q_y, 0), np.sum(1 - q_y, 0)], 1)
+        index_all = index_all + index
+    Q_y1_all = np.concatenate(Q_y1_all, 0)
+    map_index = {index_all[x]:x for x in range(len(index_all))}
+    list_index = [map_index[x] for x in range(len(index_all))]
+    cond_prob = join_prob / marg_prob
+    if not init and args.trans_em:
+        model.z_y.phi.weight.data = torch.tensor(cond_prob, dtype=torch.float32,
+                                                 device='cuda' if use_cuda else 'cpu')
+    print(model.z_y.phi.weight)
+    return Q_y1_all[list_index]
+
 
 def em_step(model, data_loader, optimizer, epoch, step, Q_y1_all):
-	dataset = RE_Dataset(data_loader, dataset='train', shuffle=True)
-	trainloader = data.DataLoader(dataset, batch_size=args.batch, num_workers=args.n_worker, collate_fn=dataset.data_collate)
-	batchs = len(trainloader)	
-	all_step = step + batchs	
-	losses = []			
-	for batch_idx, (X, musk, p1, p2, y, index) in enumerate(trainloader):	
-		X, musk, p1, p2, y, Q_y1 = [torch.from_numpy(x) for x in X], [torch.from_numpy(x) for x in musk], [torch.from_numpy(x) for x in p1], [torch.from_numpy(x) for x in p2], torch.from_numpy(np.asarray(y, dtype=np.int_)), torch.from_numpy(np.asarray(Q_y1_all[index], dtype=np.float32))
-		X, musk, p1, p2, y, Q_y1 = [Variable(x) for x in X], [Variable(x) for x in musk], [Variable(x) for x in p1], [Variable(x) for x in p2], Variable(y), Variable(Q_y1, requires_grad=False)
-		if use_cuda:
-			X, musk, p1, p2, y, Q_y1 = [x.cuda() for x in X], [x.cuda() for x in musk], [x.cuda() for x in p1], [x.cuda() for x in p2], y.cuda(), Q_y1.cuda()
-		model.train()
-		loss = model.M_step(X, musk, p1, p2, y, Q_y1)
-		loss_ = loss.item()	
-		losses.append(loss_)
-		optimizer.zero_grad()
-		loss.backward()
-		if args.clip!=0:
-			nn.utils.clip_grad_norm(model.parameters(), args.clip)		
-		optimizer.step()
-		step = step + 1		
-		print '[Epoch %d/%d ] | Iter %d/%d | Loss %f' % (epoch, args.epochs, step, all_step, loss_)	
-		if step%args.eval_per==0:
-			save_checkpoint({
-				'epoch': epoch,
-				'step': step,
-				'state_dict': model.state_dict(),
-				'optimizer' : optimizer.state_dict()
-			}, step)
-		if step%args.per_e_step==0:					
-			print 'executing e step...'
-			Q_y1_all = e_step(model, data_loader)	
-			np.save(args.save_dir+'Q_y', Q_y1_all)						
-			print 'executing m step...'	
+    dataset = RE_Dataset(data_loader, dataset='train', shuffle=True)
+    trainloader = data.DataLoader(dataset, batch_size=args.batch, num_workers=args.n_worker, collate_fn=dataset.data_collate)
+    batchs = len(trainloader)
+    all_step = step + batchs
+    losses = []
+    for batch_idx, (X, musk, p1, p2, y, index) in enumerate(trainloader):
+        X, musk, p1, p2, y, Q_y1 = [torch.from_numpy(x) for x in X], [torch.from_numpy(x) for x in musk], [torch.from_numpy(x) for x in p1], [torch.from_numpy(x) for x in p2], torch.from_numpy(np.asarray(y, dtype=np.int_)), torch.from_numpy(np.asarray(Q_y1_all[index], dtype=np.float32))
+        X, musk, p1, p2, y, Q_y1 = [Variable(x) for x in X], [Variable(x) for x in musk], [Variable(x) for x in p1], [Variable(x) for x in p2], Variable(y), Variable(Q_y1, requires_grad=False)
+        if use_cuda:
+            X, musk, p1, p2, y, Q_y1 = [x.cuda() for x in X], [x.cuda() for x in musk], [x.cuda() for x in p1], [x.cuda() for x in p2], y.cuda(), Q_y1.cuda()
+        model.train()
+        loss = model.M_step(X, musk, p1, p2, y, Q_y1)
+        loss_ = loss.item()
+        losses.append(loss_)
+        optimizer.zero_grad()
+        loss.backward()
+        if args.clip!=0:
+            nn.utils.clip_grad_norm(model.parameters(), args.clip)
+        optimizer.step()
+        step = step + 1
+        print('[Epoch %d/%d ] | Iter %d/%d | Loss %f' % (epoch, args.epochs, step, all_step, loss_))
+        if step%args.eval_per==0:
+            save_checkpoint({
+                'epoch': epoch,
+                'step': step,
+                'state_dict': model.state_dict(),
+                'optimizer' : optimizer.state_dict()
+            }, step)
+        if step%args.per_e_step==0:
+            print('executing e step...')
+            Q_y1_all = e_step(model, data_loader, init=args.fix_label)
+            np.save(args.save_dir+'Q_y', Q_y1_all)
+            print('executing m step...')
 
-	return np.mean(np.array(losses)), step, Q_y1_all
+    return np.mean(np.array(losses)), step, Q_y1_all
 
-def train_epoch_RE(model, data_loader, optimizer, epoch, step):	
-	dataset = RE_Dataset(data_loader, dataset='train', shuffle=True)
-	trainloader = data.DataLoader(dataset, batch_size=args.batch, num_workers=args.n_worker, collate_fn=dataset.data_collate)
-	batchs = len(trainloader)
-	losses = []
-	all_step = step + batchs
-	for batch_idx, (X, musk, p1, p2, y, index) in enumerate(trainloader):	
-		X, musk, p1, p2, y = [torch.from_numpy(x) for x in X], [torch.from_numpy(x) for x in musk], [torch.from_numpy(x) for x in p1], [torch.from_numpy(x) for x in p2], torch.from_numpy(np.asarray(y, dtype=np.int_))
-		X, musk, p1, p2, y = [Variable(x) for x in X], [Variable(x) for x in musk], [Variable(x) for x in p1], [Variable(x) for x in p2], Variable(y)
-		if use_cuda:
-			X, musk, p1, p2, y= [x.cuda() for x in X], [x.cuda() for x in musk], [x.cuda() for x in p1], [x.cuda() for x in p2], y.cuda()
-		model.train()		
-		loss = model.baseModel(X, musk, p1, p2, y)		
-		loss_ = loss.item()	
-		losses.append(loss_)
-		if loss_!=loss_:
-			return loss_, step
-		optimizer.zero_grad()
-		loss.backward()
-		if args.clip!=0:
-			nn.utils.clip_grad_norm(model.parameters(), args.clip)		
-		optimizer.step()
-		step = step + 1		
-		print '[Epoch %d/%d ] | Iter %d/%d | Loss %f' % (epoch, args.epochs, step, all_step, loss_)
-		if step%args.eval_per==0:
-			save_checkpoint({
-				'epoch': epoch,
-				'step': step,
-				'state_dict': model.state_dict(),
-				'optimizer' : optimizer.state_dict()
-			}, step)		
-	return np.mean(np.array(losses)), step
+
+def train_epoch_RE(model, data_loader, optimizer, epoch, step, pretrain=False, noise=False):
+    dataset = RE_Dataset(data_loader, dataset='train', shuffle=True)
+    trainloader = data.DataLoader(dataset, batch_size=args.batch, num_workers=args.n_worker, collate_fn=dataset.data_collate)
+    batchs = len(trainloader)
+    losses = []
+    all_step = step + batchs
+    for batch_idx, (X, musk, p1, p2, y, index) in enumerate(trainloader):
+        X, musk, p1, p2, y = [torch.from_numpy(x) for x in X], [torch.from_numpy(x) for x in musk], [torch.from_numpy(x) for x in p1], [torch.from_numpy(x) for x in p2], torch.from_numpy(np.asarray(y, dtype=np.int_))
+        X, musk, p1, p2, y = [Variable(x) for x in X], [Variable(x) for x in musk], [Variable(x) for x in p1], [Variable(x) for x in p2], Variable(y)
+        if use_cuda:
+            X, musk, p1, p2, y= [x.cuda() for x in X], [x.cuda() for x in musk], [x.cuda() for x in p1], [x.cuda() for x in p2], y.cuda()
+        model.train()
+        if noise:
+            if args.use_rl:
+                loss = model.noiseModel_RL(X, musk, p1, p2, y)
+            else:
+                loss = model.noiseModel(X, musk, p1, p2, y)
+        else:
+            loss = model.baseModel(X, musk, p1, p2, y)
+        loss_ = loss.item()
+        losses.append(loss_)
+        if loss_!=loss_:
+            return loss_, step
+        optimizer.zero_grad()
+        loss.backward()
+        if args.clip!=0:
+            nn.utils.clip_grad_norm(model.parameters(), args.clip)
+        optimizer.step()
+        step = step + 1
+        print('[Epoch %d/%d ] | Iter %d/%d | Loss %f' % (epoch, args.epochs, step, all_step, loss_))
+        if step%args.eval_per==0 and not pretrain:
+            save_checkpoint({
+                'epoch': epoch,
+                'step': step,
+                'state_dict': model.state_dict(),
+                'optimizer' : optimizer.state_dict()
+            }, step)
+    return np.mean(np.array(losses)), step
+
 
 def train_RE():
-	data_loader = DataLoader(args.data_dir, args.max_bags, args.max_len, mode=args.mode, flip=args.flip)
-	model = RE(args.dim, args.pos_dim, args.hdim, data_loader.n_word, data_loader.n_pos, data_loader.n_relation, args.reg_weight, reduce_method=args.reduce_method, position=args.position, encode_model=args.encoder, sigmoid=args.sigmoid, init1=args.init1, init2=args.init2, na_init1=args.na_init1, na_init2=args.na_init2)	
-	if use_cuda:
-		model = model.cuda()
-	optimizer = use_optimizer(model, lr=args.lr, method=args.optimizer)
-	start_epoch = 0
-	step = 0			
-	if not os.path.exists(args.save_dir):
-		os.makedirs(args.save_dir)		
-	if args.resume != -1:
-		checkpoint = resume(args.resume)
-		start_epoch = checkpoint['epoch']
-		step = checkpoint['step']		
-		model.load_state_dict(checkpoint['state_dict'])
-		optimizer.load_state_dict(checkpoint['optimizer'])
+    data_loader = DataLoader(args.data_dir, args.max_bags, args.max_len, mode=args.mode, flip=args.flip)
+    model = RE(args, args.dim, args.pos_dim, args.hdim, data_loader.n_word, data_loader.n_pos, data_loader.n_relation, args.reg_weight, reduce_method=args.reduce_method, position=args.position, encode_model=args.encoder, sigmoid=args.sigmoid, init1=args.init1, init2=args.init2, na_init1=args.na_init1, na_init2=args.na_init2, requires_grad=args.requires_grad, norm=args.norm, q=args.q, l2=args.l2, noise=args.noise, beta=args.beta, base=args.base)
+    if use_cuda:
+        model = model.cuda()
+    optimizer = use_optimizer(model, lr=args.lr, method=args.optimizer)
+    start_epoch = 0
+    step = 0
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
+    if args.resume != -1:
+        checkpoint = resume(args.resume)
+        start_epoch = checkpoint['epoch']
+        step = checkpoint['step']
+        model.load_state_dict(checkpoint['state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
 
-	for epoch in range(start_epoch, args.epochs):
-		loss, step = train_epoch_RE(model, data_loader, optimizer, epoch, step)
-		if loss!=loss:
-			print 'NaN loss'
-			break
-		print 'Epoch %d train over, average loss: %f' % (epoch, loss)
-		with open(args.save_dir+'train_log.txt', 'ab') as f:
-			f.write("[train] epoch %d step %d loss: %f\n" % (epoch, step, loss))
+    if args.pretrain:
+        for epoch in range(start_epoch, args.pretrain_epochs):
+            if args.curriculum:
+                args.temperature = 1. / (start_epoch + 1)
+            loss, step = train_epoch_RE(model, data_loader, optimizer, epoch, step, True, False)
+            if loss!=loss:
+                print('NaN loss')
+                return
+            print('Epoch %d train over, average loss: %f' % (epoch, loss))
+            with open(args.save_dir+'train_log.txt', 'a') as f:
+                f.write("[train] epoch %d step %d loss: %f\n" % (epoch, step, loss))
+    step = 0
+
+    for epoch in range(start_epoch, args.epochs):
+        loss, step = train_epoch_RE(model, data_loader, optimizer, epoch, step, False, args.noise)
+        if loss!=loss:
+            print('NaN loss')
+            break
+        print('Epoch %d train over, average loss: %f' % (epoch, loss))
+        with open(args.save_dir+'train_log.txt', 'a') as f:
+            f.write("[train] epoch %d step %d loss: %f\n" % (epoch, step, loss))
+
 
 def train_EM():
-	data_loader = DataLoader(args.data_dir, args.max_bags, args.max_len, mode=args.mode, flip=args.flip)	
-	model = RE(args.dim, args.pos_dim, args.hdim, data_loader.n_word, data_loader.n_pos, data_loader.n_relation, args.reg_weight, reduce_method=args.reduce_method, position=args.position, encode_model=args.encoder, sigmoid=args.sigmoid, init1=args.init1, init2=args.init2, na_init1=args.na_init1, na_init2=args.na_init2)
-	if use_cuda:
-		model = model.cuda()
-	optimizer = use_optimizer(model, lr=args.lr, method=args.optimizer)
-	start_epoch = 0
-	step = 0
+    data_loader = DataLoader(args.data_dir, args.max_bags, args.max_len, mode=args.mode, flip=args.flip)
+    model = RE(args, args.dim, args.pos_dim, args.hdim, data_loader.n_word, data_loader.n_pos, data_loader.n_relation, args.reg_weight, reduce_method=args.reduce_method, position=args.position, encode_model=args.encoder, sigmoid=args.sigmoid, init1=args.init1, init2=args.init2, na_init1=args.na_init1, na_init2=args.na_init2, requires_grad=args.requires_grad, norm=args.norm, q=args.q, l2=args.l2, noise=args.noise, beta=args.beta, base=args.base)
+    if use_cuda:
+        model = model.cuda()
+    optimizer = use_optimizer(model, lr=args.lr, method=args.optimizer)
+    start_epoch = 0
+    step = 0
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
 
-	print 'executing e step...'	
-	Q_y1_all = e_step(model, data_loader, init=True)	
-	if not os.path.exists(args.save_dir):
-		os.makedirs(args.save_dir)		
-	if args.resume != -1:
-		checkpoint = resume(args.resume)
-		start_epoch = checkpoint['epoch']+1
-		step = checkpoint['step']		
-		model.load_state_dict(checkpoint['state_dict'])
-		optimizer.load_state_dict(checkpoint['optimizer'])
-		Q_y1_all = np.load(args.save_dir+'Q_y.npy')
+    if args.pretrain:
+        for epoch in range(start_epoch, args.pretrain_epochs):
+            loss, step = train_epoch_RE(model, data_loader, optimizer, epoch, step, True)
+            if loss!=loss:
+                print('NaN loss')
+                return
+            print('Epoch %d train over, average loss: %f' % (epoch, loss))
+            with open(args.save_dir+'train_log.txt', 'a') as f:
+                f.write("[train] epoch %d step %d loss: %f\n" % (epoch, step, loss))
+        get_theta(model, data_loader)
+    step = 0
 
-	print 'executing m step...'		
-	for epoch in range(start_epoch, args.epochs):
-		loss, step, Q_y1_all = em_step(model, data_loader, optimizer, epoch, step, Q_y1_all)
-		print 'Epoch %d train over, average loss: %f' % (epoch, loss)		
-		with open(args.save_dir+'train_log.txt', 'ab') as f:
-			f.write("[train] epoch %d step %d loss: %f\n" % (epoch, step, loss))	
+    print('executing e step...')
+    Q_y1_all = e_step(model, data_loader, init=True)
+    if args.resume != -1:
+        checkpoint = resume(args.resume)
+        start_epoch = checkpoint['epoch']+1
+        step = checkpoint['step']
+        model.load_state_dict(checkpoint['state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        Q_y1_all = np.load(args.save_dir+'Q_y.npy')
 
-def test_model():
-	data_loader = DataLoader(args.data_dir, args.max_bags, args.max_len, mode=args.mode, flip=args.flip)
-	model = RE(args.dim, args.pos_dim, args.hdim, data_loader.n_word, data_loader.n_pos, data_loader.n_relation, args.reg_weight, reduce_method=args.reduce_method, position=args.position, encode_model=args.encoder, sigmoid=args.sigmoid, init1=args.init1, init2=args.init2, na_init1=args.na_init1, na_init2=args.na_init2)	
-	if use_cuda:
-		model = model.cuda()
-	optimizer = use_optimizer(model, lr=args.lr, method=args.optimizer)	
+    print('executing m step...')
+    for epoch in range(start_epoch, args.epochs):
+        loss, step, Q_y1_all = em_step(model, data_loader, optimizer, epoch, step, Q_y1_all)
+        print('Epoch %d train over, average loss: %f' % (epoch, loss))
+        with open(args.save_dir+'train_log.txt', 'a') as f:
+            f.write("[train] epoch %d step %d loss: %f\n" % (epoch, step, loss))
 
-	if not os.path.exists(args.save_dir):
-		os.makedirs(args.save_dir)		
 
-	step = 500
-	dataset = 'test'
-	best_ap = 0.
-	while step<=17500:
-		checkpoint = resume(step)
-		model.load_state_dict(checkpoint['state_dict'])	
-		y_score,Y_test,ap, p,r,f1 = pred_RE(model, data_loader, dataset=dataset)
-		if ap>=best_ap:
-			best_ap = ap
-			get_pre_recall(y_score,Y_test)
-		print "step %d p: %f r: %f f1: %f Average Precision: %f" % (step, p,r,f1, ap)	
-		with open(args.save_dir+'%s_log_pr.txt'%(dataset), 'ab') as f:
-			f.write("step %d p: %f r: %f f1: %f Average Precision: %f\n" % (step, p,r,f1, ap))	
-		step += 500	
+def test_model(dataset='test'):
+    data_loader = DataLoader(args.data_dir, args.max_bags, args.max_len, mode=args.mode, flip=args.flip)
+    model = RE(args, args.dim, args.pos_dim, args.hdim, data_loader.n_word, data_loader.n_pos, data_loader.n_relation, args.reg_weight, reduce_method=args.reduce_method, position=args.position, encode_model=args.encoder, sigmoid=args.sigmoid, init1=args.init1, init2=args.init2, na_init1=args.na_init1, na_init2=args.na_init2, requires_grad=args.requires_grad, norm=args.norm, q=args.q, l2=args.l2, noise=args.noise, beta=args.beta, base=args.base)
+    if use_cuda:
+        model = model.cuda()
+    optimizer = use_optimizer(model, lr=args.lr, method=args.optimizer)
 
-	print 'best ap: %f'%best_ap
-	with open(args.save_dir+'%s_log_pr.txt'%(dataset), 'ab') as f:
-		f.write('best ap: %f\n'%best_ap)	
+    if not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
+
+    step = 500
+    best_ap = 0.
+    while step<=17500:
+        checkpoint = resume(step)
+        model.load_state_dict(checkpoint['state_dict'])
+        y_score,Y_test,ap, p,r,f1 = pred_RE(model, data_loader, dataset=dataset)
+        if ap>=best_ap:
+            best_ap = ap
+            get_pre_recall(y_score,Y_test, dataset=dataset)
+        print("step %d p: %f r: %f f1: %f Average Precision: %f" % (step, p,r,f1, ap))
+        with open(args.save_dir+'%s_log_pr.txt'%(dataset), 'a') as f:
+            f.write("step %d p: %f r: %f f1: %f Average Precision: %f\n" % (step, p,r,f1, ap))
+        step += 500
+
+    print('best ap: %f'%best_ap)
+    with open(args.save_dir+'%s_log_pr.txt'%(dataset), 'a') as f:
+        f.write('best ap: %f\n'%best_ap)
+
 
 def main():
-	print args
-	if args.run_mode=='train':
-		if args.em:
-			train_EM()
-		else:			
-			train_RE()
-		test_model()
-	elif args.run_mode=='test':		
-		test_model()
+    print(args)
+    if args.run_mode=='train':
+        if args.em:
+            train_EM()
+        else:
+            train_RE()
+        test_model()
+    elif args.run_mode=='test':
+        test_model()
+    elif args.run_mode=='test_auto':
+        test_model('test_auto')
+
 
 if __name__ == '__main__':
-	main()	
-
+    main()
